@@ -10,6 +10,7 @@ app = Flask(__name__)
 # Use environment variable for data file location (Render persistent storage)
 DATA_DIR = os.environ.get('DATA_DIR', '.')
 TRACKING_FILE = os.path.join(DATA_DIR, 'email_opens.json')
+METADATA_FILE = os.path.join(DATA_DIR, 'email_metadata.json')
 
 def load_tracking_data():
     """Load tracking data from JSON file"""
@@ -30,6 +31,49 @@ def save_tracking_data(data):
     except Exception as e:
         print(f"❌ Error saving tracking data: {e}")
 
+def load_metadata():
+    """Load email metadata (sender info, recipient info)"""
+    if os.path.exists(METADATA_FILE):
+        try:
+            with open(METADATA_FILE, 'r') as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            print("⚠️  Corrupted metadata file, creating new one")
+            return {}
+    return {}
+
+def save_metadata(data):
+    """Save email metadata"""
+    try:
+        with open(METADATA_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"❌ Error saving metadata: {e}")
+
+def is_sender_open(tracking_id, user_agent, referer):
+    """
+    Detect if the open is from the sender (viewing their own sent/draft email)
+    Returns True if this is likely the sender, False if likely the recipient
+    """
+    metadata = load_metadata()
+    
+    if tracking_id not in metadata:
+        return False  # No metadata, can't determine
+    
+    sender_email = metadata[tracking_id].get('sender_email', '')
+    
+    # Check if opening from Gmail's sent/drafts interface
+    # Gmail adds specific patterns when viewing sent/draft emails
+    referer_lower = referer.lower() if referer else ''
+    
+    # Indicators this is the sender viewing their own email:
+    sender_indicators = [
+        'mail.google.com/mail' in referer_lower and ('sent' in referer_lower or 'draft' in referer_lower),
+        'mail.google.com/mail/u/' in referer_lower,  # Gmail web interface
+    ]
+    
+    return any(sender_indicators)
+
 @app.route('/')
 def home():
     """Home page with API documentation"""
@@ -45,6 +89,49 @@ def home():
         'timestamp': datetime.now().isoformat()
     })
 
+@app.route('/register', methods=['POST'])
+def register_email():
+    """
+    Register email metadata (sender, recipient) before sending
+    This helps filter out sender's own opens
+    
+    POST body:
+    {
+        "tracking_id": "abc-123-def",
+        "sender_email": "sender@gmail.com",
+        "recipient_email": "recipient@example.com"
+    }
+    """
+    try:
+        data = request.get_json()
+        tracking_id = data.get('tracking_id')
+        sender_email = data.get('sender_email')
+        recipient_email = data.get('recipient_email')
+        
+        if not tracking_id or not sender_email or not recipient_email:
+            return jsonify({'error': 'Missing required fields'}), 400
+        
+        metadata = load_metadata()
+        metadata[tracking_id] = {
+            'sender_email': sender_email,
+            'recipient_email': recipient_email,
+            'registered_at': datetime.now().isoformat()
+        }
+        save_metadata(metadata)
+        
+        print(f"📝 Registered email: {tracking_id}")
+        print(f"   Sender: {sender_email}")
+        print(f"   Recipient: {recipient_email}")
+        
+        return jsonify({
+            'success': True,
+            'tracking_id': tracking_id
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Error registering email: {e}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/health')
 def health():
     """Health check endpoint for Render"""
@@ -58,34 +145,55 @@ def track_pixel(tracking_id):
     """
     Tracking pixel endpoint
     Returns 1x1 transparent PNG and logs the email open
+    Filters out sender's own opens
     """
+    # Get request details
+    user_agent = request.user_agent.string
+    referer = request.headers.get('Referer', '')
+    
     # Log the request
     print(f"📧 Tracking pixel requested: {tracking_id}")
     print(f"   From IP: {request.remote_addr}")
-    print(f"   User-Agent: {request.user_agent.string[:100]}")
-    print(f"   Referer: {request.headers.get('Referer', 'N/A')}")
+    print(f"   User-Agent: {user_agent[:100]}")
+    print(f"   Referer: {referer}")
+    
+    # Check if this is the sender viewing their own email
+    if is_sender_open(tracking_id, user_agent, referer):
+        print(f"   ⏭️  SENDER OPEN DETECTED - Not counting")
+        # Still return the pixel, but don't count it
+        img = Image.new('RGBA', (1, 1), (0, 0, 0, 0))
+        img_io = BytesIO()
+        img.save(img_io, 'PNG')
+        img_io.seek(0)
+        
+        response = make_response(send_file(img_io, mimetype='image/png'))
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, private'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        return response
     
     # Load current tracking data
     data = load_tracking_data()
     
-    # Record the open
+    # Record the open (only for recipient opens)
     if tracking_id not in data:
         data[tracking_id] = {
             'first_opened': datetime.now().isoformat(),
             'open_count': 1,
             'opens': []
         }
-        print(f"   ✅ FIRST OPEN RECORDED!")
+        print(f"   ✅ FIRST RECIPIENT OPEN RECORDED!")
     else:
         data[tracking_id]['open_count'] += 1
-        print(f"   📊 Open count: {data[tracking_id]['open_count']}")
+        print(f"   📊 Recipient open count: {data[tracking_id]['open_count']}")
     
     # Log this specific open event
     data[tracking_id]['opens'].append({
         'timestamp': datetime.now().isoformat(),
         'ip': request.remote_addr,
-        'user_agent': request.user_agent.string,
-        'referer': request.headers.get('Referer', 'unknown')
+        'user_agent': user_agent,
+        'referer': referer
     })
     
     # Save updated data
